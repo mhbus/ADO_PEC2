@@ -1,0 +1,756 @@
+---
+title: "PEC2 Análisis de Datos Ómicos"
+author: "Miguel Herrera Bustillo"
+date: "Junio, 2020"
+output:
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+    df_print: paged
+  html_document:
+    toc: yes
+subtitle: RNA-seq
+params:
+  file1: targets.csv
+  file2: counts.csv
+  seed: 12345
+nocite: |
+bibliography: referencias.bib
+---
+
+```{r setup, include = FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, 
+                      comment = NA, prompt = TRUE, tidy = FALSE, 
+                      fig.width = 4, fig.height = 4, fig.align = "center", fig_caption = TRUE,
+                      cache=FALSE)
+```
+
+
+```{r librerias, include = FALSE}
+# Paquetes
+require(biomaRt)
+require(limma)
+require(edgeR)
+require(topGO)
+require(VennDiagram)
+require(Rgraphviz)
+```
+
+
+### NOTAS
+
+El código en R contiene anotaciones para tener constancia del funcionamiento del código y tratar de organizarlo según los resultados.
+
+En algunas secciones de código (principalmente anotaciones en el mismo) se han omitido las tildes de manera intencionada para tratar de evitar posibles errores.
+
+Algunas líneas de código referentes al uso de paquetes han sido basadas en las propuestas por la asignatura, por considerarlas elegantes y relativamente sencillas de comprender. Por supuesto, este código ha sido adaptado al informe, modificado según los requerimientos y consultado en la ayuda en los casos en los que ha sido necesario, no se ha usado código sin entender previamente su funcionamiento (dado que eso sería ir en contra de los objetivos de la PEC).
+
+Algunos términos se muestran en inglés para facilitar su comprensión y poder ser referenciados mejor en caso de buscar información en las fuentes bibliográficas. Su traducción resultaba en cierta manera "artificial" y literal, por lo que se ha decidido mantener su forma original.
+
+El aspecto de algunas figuras se ha visto afectado por la reducción de tamaño que se llevó a cabo para favorecer la presentación en PDF. En ningún caso limita la visualización de información de manera efectiva, sin embargo, es posible que afecte a la estética de la figura en algún caso.
+
+
+# 1. Abstract
+
+En este informe se presenta un análisis de expresión diferencial para 3 grupos de muestras procedentes de un estudio sobre la tiroides. Estos datos han sido obtenidos de la base de datos GTEx (Genotype-Tissue Expression). Tras analizar los datos de expresión (RNA-seq) para los 3 tipos de infiltración es posible apreciar diferencias significativas en los niveles de expresión génica entre ELI (*Extensive lymphoid infiltrates*) y los otros 2 grupos. SFI (*Small focal infiltrates*) y NIT (*Not infiltrated tissues*) no presentan unas diferencias tan marcadas (los genes diferencialmente expresados encontrados no son muy numerosos). El posterior análisis de significación biológica (*Gene Enrichment Analysis*) indica que los principales procesos están relacionados con el sistema inmune.
+
+
+# 2. Objetivos
+
+El Pipeline de análisis presentado pretende encontrar genes diferencialmente expresados en las muestras, así como relacionarlos (si fuera posible) con procesos y/o funciones biológicas.
+
+Se llevará a cabo la comparación con las siguientes combinaciones:
+
+* NIT - SFI
+* NIT - ELI
+* SFI - ELI
+* Genes coincidentes entre los 3 grupos
+
+# 3. Materiales y Métodos
+
+## 3.1 Naturaleza de los datos, diseño y tipo de experimento
+
+Los datos pertenecen a un estudio obtenido de la base de datos **GTEx**. Se corresponden con datos de expresión (RNA-Seq) pertenecientes a un análisis de la tiroides en donde se compara tres tipos de infiltración medido en un total de 292
+muestras organizadas en tres grupos:
+
+```{r tabla1, echo = FALSE}
+
+# Creacion de vectores
+
+codigo_tej <- c("NIT","SFI","ELI")
+
+tipo_tej <- c("Not infiltrated tissues","Small focal infiltrates","Extensive lymphoid infiltrates")
+
+num_tej <- c("236","42","14")
+
+tabla_tej <- data.frame(codigo_tej, tipo_tej, num_tej)
+
+# Se genera la tabla a partir del dataframe creado anteriormente
+
+kable(tabla_tej, col.names=c("Abreviación", "Tipo de tejido", "Número de muestras"), format = "markdown")
+```
+**tabla 1.** Grupos de muestras.
+
+
+Se proporcionan los datos preprocesados en una tabla de contajes y se solicita una selección de 30 muestras (10 por cada grupo) para su análisis.
+
+Se trabaja con 2 ficheros csv iniciales:  
+- **counts**, con los datos de expresión (contaje) RNA-seq para 292 muestras acompañadas de un identificador del gen.  
+- **targets**, con información pertinente de cada muestra (como el tipo de infiltración).
+
+```{r lectura de datos, include = FALSE}
+targets = read.csv(file.path("data", params$file1), header = TRUE)
+counts = read.csv(file.path("data", params$file2), sep = ";", header = TRUE)
+```
+
+Se mostrará un script realizado para extraer 10 muestras de cada grupo de manera aleatoria. Para ello se usará la columna "Groups" del archivo `r params$file1`. Posteriormente, con la información de las filas seleccionadas se "subsetearán" las columnas escogidas en el archivo `r params$file2`.
+
+```{r extraccion}
+# Semilla
+set.seed(params$seed)
+
+# Selecciona los targets para cada grupo y extrae 10 muestras
+# NIT
+NIT <- subset(targets, Group == "NIT")
+NIT_sample10 <- NIT[sample(nrow(NIT), size = 10),]
+# SFI
+SFI <- subset(targets, Group == "SFI")
+SFI_sample10 <- SFI[sample(nrow(SFI), size = 10),]
+# ELI
+ELI <- subset(targets, Group == "ELI")
+ELI_sample10 <- ELI[sample(nrow(ELI), size = 10),]
+
+# Se genera un único dataframe con los targets
+targets_sample <- rbind(NIT_sample10, SFI_sample10, ELI_sample10)
+
+# Sustituye los guiones por puntos en los nombres de las muestras. De esta manera coincidirán con los de counts
+sample_names <- targets_sample$Sample_Name
+sample_names_fix <- gsub("-", ".", sample_names)
+
+# Counts subset
+# Eliminar .* de los identificadores de gen: rownames(counts_sample) <- gsub("\\..*", "", rownames(counts_sample))
+counts_sample <- counts[,sample_names_fix]
+rownames(counts_sample) <- counts[,1]
+
+# Es posible cambiar los nombres de las columnas (nombres de las muestras) por algo más indicativo
+new_colnames <- c(paste0("NIT", 1:10), paste0("SFI", 1:10), paste0("ELI", 1:10))
+colnames(counts_sample) <- new_colnames
+
+# coldata factor
+coldata <- data.frame(new_colnames, type = c(rep("NIT",10),rep("SFI",10),rep("ELI",10)))
+coldata$type <- factor(coldata$type, levels = c("NIT","SFI","ELI"))
+```
+
+
+## 3.2 Métodos y herramientas
+
+### 3.2.1
+
+Tras el procesado de los datos se procede a realizar el análisis de expresión diferencial (DE) empleando el paquete `edgeR`. Este paquete cuenta con una amplia documentación bibliográfica.
+
+La metodología consistirá en hacer uso de este y otros paquetes complementarios en R para realizar el filtraje, normalización y análisis DE para las 3 comparaciones: NIT-SFI, NIT-ELI, SFI-ELI. Finalmente se realiza un análisis de significación biológica (anotaciones y Gene Enrichment analysis).
+
+*Pipeline*
+
+- Filtraje
+- Normalización
+- Exploración de los datos
+- Expresión Diferencial
+- Significación Biológica
+
+
+### 3.2.2
+
+Entorno:  
+R version 3.6.3 (2020-02-29)  
+RStudio Version 1.2.5033  
+Bioconductor Version 3.10
+
+**Repositorio en GitHub**: https://github.com/mhbus/ADO_PEC2
+
+
+## 3.3 Procedimiento del análisis
+
+`edgeR` trabaja en un tipo determinado de objeto denominado `DGEList`, con forma de tabla de contajes cuyas filas y columnas se corresponden con los datos que hemos obtenido anteriormente.
+
+Cabe decir que esta variable que definiremos como `d` se trata de una manera particular, en la cual `edgeR` no sobreescribe la información, sino que se agrega. Esta filosofía de `edgeR` facilita el manejo de los elementos en `d`.
+
+```{r objeto DGEList}
+d <- DGEList(counts = counts_sample, group = coldata$type)
+```
+
+
+### 3.1.1 Filtraje
+
+El primer paso será deshacerse de los genes cuya frecuencia no sea suficientemente significativa para el análisis. Uno de los criterios recomendados para este fin es eliminar genes sin al menos 1 *read per million* en *n* muestras, siendo *n* el tamaño del menor grupo (1). En nuestro caso *n* = 10 para todos los grupos.
+
+```{r cpm}
+# Dimensiones
+dim(d)
+
+# Filtro
+cpms <- cpm(d)
+keep <- rowSums(cpms >1) >=10
+d <- d[keep,]
+
+# Dimensiones
+dim(d)
+
+# contaje de genes total por muestra: apply(d$counts, 2, sum)
+```
+
+
+Se puede observar cómo ha disminuido el número de genes tras el filtraje. Esto significa que se han eliminado aquellos genes cuya importancia no era suficiente de cara a un análisis de DE, de modo que la cantidad de información perdida es relativamente pequeña.
+
+
+```{r lib size, eval = FALSE}
+# Si se desea recalcular el tamaño de las librerias
+# El análisis es robusto independientemente de si se realiza o no
+d$samples$lib.size <- colSums(d$counts)
+head(d$samples)
+```
+
+
+```{r Expr, eval = FALSE}
+# Filtro 2
+# Una alternativa
+keep_Expr <- filterByExpr(d)
+d <- d[keep_Expr, , keep.lib.sizes=FALSE]
+dim(d)
+```
+
+
+### 3.1.2 Normalización
+
+`edgeR` se centra en el análisis de expresión diferencial más que en la cuantificación de los niveles de expresión. Esto quiere decir que se centra en los cambios relativos de expresión entre condiciones, pero no directamente en estimar los niveles de expresión absolutos. Esto permite simplificar los ajustes técnicos tenidos en cuenta para la normalización.
+
+La función `calcNormFactors()` de este paquete normaliza los datos buscando una serie de *scaling factors* para los tamaños de librería que minimicen los cambios de *log-fold* entre muestras para la mayor parte de los genes. El método para computar estos factores se basa en el uso de *trimmed mean of M-values* (**TMM**).
+
+El producto del tamaño original de la librería y el *scaling factor* se denomina tamaño efectivo de la librería, y reemplaza al tamaño original de la librería en los posteriores análisis.
+
+Esto es un resumen acerca de cómo `edgeR` normaliza los datos, aunque puede leerse más extensamente en la documentación oficial (2).
+
+```{r normaliz}
+d <- calcNormFactors(d)
+plotMD(cpm(d, log=TRUE),column = 1)
+abline(h=0, col="red", lty=2, lwd=2)
+```
+
+Para NIT1 como ejemplo.
+
+### 3.1.3 Exploración de los datos
+
+Antes de llevar a cabo los análisis de DE para las comparaciones es conveniente inspeccionar las relaciones entre las muestras. Para ello es posible usar una gráfica de escalado multidimensional (**MDS**).
+
+```{r MDS, echo=FALSE}
+plotMDS(d, col = as.numeric(d$samples$group))
+legend("topleft", as.character(unique(d$samples$group)),col=1:3, pch=20)
+```
+
+Gráfica 1. Las muestras que guardan mayor similaridad se encontrarán más cercanas entre sí.
+
+Es posible usar otro método para computar las distancias. En este caso *BCV*.
+
+```{r MDS bcv, echo=FALSE}
+#BCV
+plotMDS(d, method = "bcv", col = as.numeric(d$samples$group))
+legend("topleft", as.character(unique(d$samples$group)),col=1:3, pch=20)
+```
+
+Gráfica 2. A simple vista no se observan cambios drásticos respecto a la primera gráfica.
+
+Podemos apreciar cómo los grupos NIT y ELI presentan una diferencia más marcada.
+
+También es posible estimar la **dispersión**. Esto es una medida del grado de variación "inter-librería" para cada *tag* (gen). Es decir, se estima la dispersión para tener una idea de la variabilidad de los genes para este conjunto de datos.
+
+En primer lugar se asume que todos los *tags* tienen la misma dispersión (común). Esto es necesario como paso previo a la estimación de la dispersión *empirical Bayes tagwise*. En el Apéndice se discute brevemente sobre la elección de la dispersión *tagwise* frente a *common* para este caso en concreto (ver Apéndice).
+
+```{r estimacion dispersion}
+d <- estimateCommonDisp(d)
+d <- estimateTagwiseDisp(d)
+names(d)
+```
+
+Representaremos en una gráfica el tagwise BCV (*biological coefficient of variation*) respecto al log2-CPM (3).
+
+También se creará una representación visual de la relación *mean-variance* (cada punto representa la varianza y media estimada para cada gen).
+
+```{r echo=FALSE}
+plotMeanVar(d, show.tagwise.vars = TRUE, NBline = TRUE)
+plotBCV(d)
+```
+
+
+### 3.1.4 Expresión Diferencial
+
+Podemos realizar el test de expresión diferencial en `edgeR` de la siguiente manera. Se ha decidido usar la dispersión *tagwise*.
+
+```{r test DE}
+# NIT-SFI
+de12 = exactTest(d, pair = c("NIT","SFI"))
+
+# NIT-ELI
+de13 = exactTest(d, pair = c("NIT","ELI"))
+
+# SFI-ELI
+de23 = exactTest(d, pair = c("SFI","ELI"))
+```
+
+También es posible calcular el número total de genes diferencialmente expresados (a FDR<0.05), identificados por *up/down regulation*.
+
+```{r num genes}
+# NIT-SFI
+de12_n <- decideTestsDGE(de12, adjust.method="BH", p.value=0.05)
+
+# NIT-ELI
+de13_n <- decideTestsDGE(de13, adjust.method="BH", p.value=0.05)
+
+# SFI-ELI
+de23_n <- decideTestsDGE(de23, adjust.method="BH", p.value=0.05)
+```
+
+Podrían identificarse también los genes DE coincidentes entre los 3 grupos.
+
+```{r genes coincidente}
+de1tags12 <- rownames(d)[as.logical(de12_n)]
+de1tags13 <- rownames(d)[as.logical(de13_n)]
+de1tags23 <- rownames(d)[as.logical(de23_n)]
+
+de_coinci <- Reduce(intersect, list(de1tags12,de1tags13,de1tags23))
+```
+
+
+### 3.1.4 Análisis de significación biológica
+
+Como parte final del estudio se procederá a un análisis de significación biológica para los genes DE identificados.
+
+Nos fijamos en que los *tags* para los genes corresponden a IDs Ensembl. En la dirección oficial de Ensembl se ofrecen varias fuentes de ayuda, incluido el manejo de `biomaRt`, un paquete dedicado a este tipo de tareas que facilita el tratamiento de datos. En este caso, al tratarse de genes catalogados mediante ensembl ID he creído adecuado utilizar esta herramienta (4).
+
+Se debe buscar y seleccionar el dataset adecuado para nuestros datos, hsapiens_gene_ensembl (correspondiente a GRCh38.p13).
+
+```{r busqueda biomart, eval=FALSE}
+bm <- useMart(biomart = "ensembl")
+listDatasets(bm)
+```
+
+```{r biomart}
+bm <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+```
+
+con esto se creará un objeto "mart" que permitirá anotar los resultados y relacionarlos con los términos GO correspondientes.
+
+
+**Generalized Linear Model (GLM)**
+
+En vista de la información que se tiene del tipo de experimento y la naturaleza de los datos se ha optado por la aproximación clásica del paquete `edgeR`. Dado que se realizarán comparaciones 2 a 2 simples entre los grupos, sin llegar a profundizar en los factores que se espera que afecten a los niveles de expresión, se ha decidido mantener el modelo clásico.
+
+Sin embargo, existe otro tipo de aproximación (GLM), indicada para diseños de experimentos más complejos. Esta aproximación constituye una extensión del modelo clásico y tiene funciones dedicadas dentro del paquete. Su uso está indicado para diseños de 3 o más grupos (sobre todo varios factores) y del tipo control - tratamiento, ya que permitiría tener en cuenta por ejemplo el efecto de la dosis sobre los niveles de expresión. También permite manejar factores del tipo *Batch effect*, es decir, efectos provocados por factores no biológicos que pueden no resultar de interés y que podrían llevar a conclusiones inexactas o erróneas.
+
+Dado el interés y la utilidad de esta aproximación GLM, he creído conveniente tratarla en el Apéndice (Ver Apéndice. GLM). Se comprobará si los resultados varían.
+
+
+# 4. Resultados
+
+En esta sección se visualizarán y analizarán los resultados obtenidos a partir de las comparaciones pertinentes previamente realizadas. Se identificarán los genes diferencialmente expresados para cada una. Posteriormente se muestran los resultados del análisis *Gene Enrichment*. Por razones de limpieza, solo se mostrará el código para la primera comparación.
+
+
+## 4.1 Genes diferencialmente expresados
+
+**NIT-SFI**
+
+Se presenta para cada comparación un resumen de los genes DE, clasificados según up/down regulados, así como una lista de los 5 primeros *tags* ordenados por p-value.
+
+Estos resultados se acompañan también de una representación gráfica (tipo *mean-difference*, MA plot).
+
+```{r}
+# Genes
+summary(de12_n)
+topTags(de12, n=5)
+
+# Tags diferencialmente expresados
+de1tags12 <- rownames(d)[as.logical(de12_n)] 
+plotSmear(de12, de.tags=de1tags12)
+abline(h = c(-1, 1), col = "blue")
+```
+
+
+**NIT-ELI**
+
+```{r echo=FALSE}
+# Genes
+summary(de13_n)
+topTags(de13, n=5)
+
+# Tags diferencialmente expresados
+de1tags13 <- rownames(d)[as.logical(de13_n)] 
+plotSmear(de13, de.tags=de1tags13)
+abline(h = c(-1, 1), col = "blue")
+```
+
+
+**SFI-ELI**
+
+```{r echo=FALSE}
+# Genes
+summary(de23_n)
+topTags(de23, n=5)
+
+# Tags diferencialmente expresados
+de1tags23 <- rownames(d)[as.logical(de23_n)] 
+plotSmear(de23, de.tags=de1tags23)
+abline(h = c(-1, 1), col = "blue")
+```
+
+
+**Genes coincidentes entre los 3 grupos**
+
+Visualizamos la coincidencia de los genes DE mediante un diagrama de venn (5).
+
+```{r}
+head(de_coinci)
+```
+
+```{r echo=FALSE}
+venn_diagram <- venn.diagram(x=list("NIT-SFI"= de1tags12, "NIT-ELI" = de1tags13, "SFI-ELI" = de1tags23), filename = NULL, main = "Diagrama de Venn", fill = c(5,2,3))
+grid.newpage()
+grid.draw(venn_diagram)
+```
+
+
+
+## 4.2 Análisis de significación biológica
+
+### Anotaciones y Gene Enrichment Analysis
+
+Se analizarán los términos GO mediante el paquete `topGO`. Nuevamente, solo se mostrará el código para la primera comparación. El objetivo es encontrar los términos GO más relevantes asociados a los genes DE entre los grupos seleccionados.
+
+**NIT - SFI**
+
+Generamos una *query* con nuestros filtros y atributos, solicitando los IDs GO para nuestros genes (6).
+
+```{r anotacion}
+# NIT-SFI
+go_12 <- getBM(
+  filters = "ensembl_gene_id_version",
+  attributes = c("ensembl_gene_id_version", "go_id"),
+  values = rownames(d), mart = bm)
+```
+
+Tras la anotación observamos que no todos los genes han sido clasificados, esto se debe al filtro (limitaciones de la base de datos con la que se trabaja).
+
+También apreciamos que se han encontrado varios términos GO para cada gen individual y que para algunos genes no se han encontrado términos GO (nuevamente encontramos algunas limitaciones en este apartado).
+
+Se eliminarán las entradas sin información para términos GO.
+
+```{r}
+# Comprueba si existe IDs GO inexistentes
+table(go_12$go_id=="")
+
+# Elimina
+go_12 <- go_12[-which(go_12$go_id==""),]
+
+# Comprobación
+table(go_12$go_id=="")
+```
+
+Se crea un objeto topGOdata, que nos permitirá trabajar mejor con esta información. Pero antes es necesario establecer el formato correcto (factor y names) para el conjunto de genes. Así como crear una lista que contenga los términos GO para cada gen.
+
+```{r formato 12}
+# names y factor
+go12 <- factor(abs(de12_n))
+names(go12) <- rownames(de12_n)
+
+# Lista
+lista_genes12 <- unique(go_12$ensembl_gene_id_version)
+lista12 <- list()
+for (i in lista_genes12) {
+  lista12[[i]] = go_12[which(go_12$ensembl_gene_id_version==i),]$go_id
+}
+```
+
+topGOdata.
+
+```{r topgodata 12}
+# Objeto topGOdata 12
+go_data12 <- new("topGOdata", ontology="BP", allGenes=go12, annot = annFUN.gene2GO, gene2GO = lista12)
+```
+
+Finalmente se determinan los scores para los genes y se genera un resumen de los resultados del *enrichment analysis*. Las funciones trabajan sobre el objeto topGOdata creado anteriormente. Se acompaña además un gráfico de nodos significativos.
+
+```{r fisher 12}
+# Se usa el algoritmo weight01 y se determina el score de los tests con el Fisher’s exact test
+fisher12 = runTest(go_data12, algorithm = "weight01", statistic = "fisher")
+fisher12
+print(GenTable(go_data12, weightFisher = fisher12, orderBy = "weightFisher", topNodes = 10))
+
+# Gráfico nodos
+showSigOfNodes(go_data12, score(fisher12), firstSigNodes = 5, useInfo = "all")
+printGraph(go_data12, fisher12, firstSigNodes = 5, useInfo = "all", pdfSW = TRUE)
+```
+
+Se repite el proceso para las otras comparaciones.
+
+**NIT - ELI**
+
+```{r anotacion NIT ELI, echo=FALSE}
+# NIT-ELI
+go_13 <- getBM(
+  filters = "ensembl_gene_id_version",
+  attributes = c("ensembl_gene_id_version", "go_id"),
+  values = rownames(d), mart = bm)
+
+# Comprueba si existe IDs GO inexistentes
+
+# Elimina
+go_13 <- go_13[-which(go_13$go_id==""),]
+
+# Comprobación
+
+# names y factor
+go13 <- factor(abs(de13_n))
+names(go13) <- rownames(de13_n)
+
+# Lista
+lista_genes13 <- unique(go_13$ensembl_gene_id_version)
+lista13 <- list()
+for (i in lista_genes13) {
+  lista13[[i]] = go_13[which(go_13$ensembl_gene_id_version==i),]$go_id
+}
+
+# Objeto topGOdata 13
+go_data13 <- new("topGOdata", ontology="BP", allGenes=go13, annot = annFUN.gene2GO, gene2GO = lista13)
+
+# Se usa el algoritmo weight01 y se determina el score de los tests con el Fisher’s exact test
+fisher13 = runTest(go_data13, algorithm = "weight01", statistic = "fisher")
+fisher13
+print(GenTable(go_data13, weightFisher = fisher13, orderBy = "weightFisher", topNodes = 10))
+
+# Gráfico nodos
+showSigOfNodes(go_data13, score(fisher13), firstSigNodes = 5, useInfo = "all")
+printGraph(go_data13, fisher13, firstSigNodes = 5, useInfo = "all", pdfSW = TRUE)
+```
+
+
+**SFI - ELI**
+
+```{r anotacion SFI ELI, echo=FALSE}
+# SFI-ELI
+go_23 <- getBM(
+  filters = "ensembl_gene_id_version",
+  attributes = c("ensembl_gene_id_version", "go_id"),
+  values = rownames(d), mart = bm)
+
+# Comprueba si existe IDs GO inexistentes
+
+# Elimina
+go_23 <- go_23[-which(go_23$go_id==""),]
+
+# Comprobación
+
+# names y factor
+go23 <- factor(abs(de23_n))
+names(go23) <- rownames(de23_n)
+
+# Lista
+lista_genes23 <- unique(go_23$ensembl_gene_id_version)
+lista23 <- list()
+for (i in lista_genes23) {
+  lista23[[i]] = go_23[which(go_23$ensembl_gene_id_version==i),]$go_id
+}
+
+# Objeto topGOdata 23
+go_data23 <- new("topGOdata", ontology="BP", allGenes=go23, annot = annFUN.gene2GO, gene2GO = lista23)
+
+# Se usa el algoritmo weight01 y se determina el score de los tests con el Fisher’s exact test
+
+fisher23 = runTest(go_data23, algorithm = "weight01", statistic = "fisher")
+fisher23
+print(GenTable(go_data23, weightFisher = fisher23, orderBy = "weightFisher", topNodes = 10))
+
+# Gráfico nodos
+showSigOfNodes(go_data23, score(fisher23), firstSigNodes = 5, useInfo = "all")
+printGraph(go_data23, fisher23, firstSigNodes = 5, useInfo = "all", pdfSW = TRUE)
+```
+
+
+**Genes coincidentes entre los 3 grupos**
+
+También sería posible encontrar aquellos términos GO para los genes DE comunes entre los 3 grupos. Cabe destacar que en este caso se han repetido los tests utilizando la dispersión *common*, ya que *tagwise* restringía el número de genes hasta el punto de no poder realizar un análisis de significación adecuado. En cualquier caso, vemos que los resultados concuerdan con lo esperado.
+
+```{r anotacion genes coincidentes, echo=FALSE}
+# Repetición de tests con dispersión common
+de12 = exactTest(d, pair = c("NIT","SFI"),dispersion="common")
+de13 = exactTest(d, pair = c("NIT","ELI"),dispersion="common")
+de23 = exactTest(d, pair = c("SFI","ELI"),dispersion="common")
+#
+de12_n <- decideTestsDGE(de12, adjust.method="BH", p.value=0.01)
+de13_n <- decideTestsDGE(de13, adjust.method="BH", p.value=0.01)
+de23_n <- decideTestsDGE(de23, adjust.method="BH", p.value=0.01)
+#
+de1tags12 <- rownames(d)[as.logical(de12_n)]
+de1tags13 <- rownames(d)[as.logical(de13_n)]
+de1tags23 <- rownames(d)[as.logical(de23_n)]
+#
+de_coinci <- Reduce(intersect, list(de1tags12,de1tags13,de1tags23))
+
+# Anotación y significación
+go_coinci <- getBM(
+  filters = "ensembl_gene_id_version",
+  attributes = c("ensembl_gene_id_version", "go_id"),
+  values = rownames(d), mart = bm)
+# Comprueba si existe IDs GO inexistentes
+
+# Elimina
+go_coinci <- go_coinci[-which(go_coinci$go_id==""),]
+# Comprobación
+
+# Lista
+lista_coinci <- unique(go_coinci$ensembl_gene_id_version)
+listacoinci <- list()
+for (i in lista_coinci) {
+  listacoinci[[i]] = go_coinci[which(go_coinci$ensembl_gene_id_version==i),]$go_id
+}
+# names y factor
+gocoinci <- factor(as.integer(names(listacoinci) %in% de_coinci))
+names(gocoinci) <- lista_coinci
+
+# Objeto topGOdata coincidentes
+go_datacoinci <- new("topGOdata", ontology="BP", allGenes=gocoinci, annot = annFUN.gene2GO, gene2GO = listacoinci)
+
+# Se usa el algoritmo weight01 y se determina el score de los tests con el Fisher’s exact test
+fishercoinci = runTest(go_datacoinci, algorithm = "weight01", statistic = "fisher")
+fishercoinci
+print(GenTable(go_datacoinci, weightFisher = fishercoinci, orderBy = "weightFisher", topNodes = 10))
+
+# Gráfico nodos
+showSigOfNodes(go_datacoinci, score(fishercoinci), firstSigNodes = 5, useInfo = "all")
+printGraph(go_datacoinci, fishercoinci, firstSigNodes = 5, useInfo = "all", pdfSW = TRUE)
+```
+
+# 5. Discusión
+
+Algunas limitaciones se han comentado en su correspondiente apartado, como la limitación en el número de genes al aplicar los filtros de la herramienta `biomaRt` o la dispersión *tagwise* para los genes coincidentes. 
+
+Considero que otra limitación que mercería mención sería la del desconocimiento de ciertos puntos del estudio original y la procedencia de los datos. Esto vendría a ser una reflexión fruto de la realización de la PEC, al disponer de varias aproximaciones para la solución del problema, conocer ciertas características del experimento pueden suponer la elección de una u otra según sea más conveniente.
+
+# 6. Apéndice
+
+## Sobre las dispersiones *common* y *tagwise*
+
+Durante la realización de esta PEC se observó que al usar la dispersión *tagwise* se encontraron pocos genes diferencialmente expresados en relación con la dispersión *common* (debido a sus características podría decirse que se trata de un método más específico y restrictivo). La mayoría de las fuentes consultadas recomendaban el uso de *tagwise* como método rutinario para este tipo de análisis. 
+
+Para salir de dudas se realizaron en paralelo los mismos análisis usando el tipo de dispersión *common*. Se graficaron ambas dispersiones para compararlas (en el caso de GLM se dibujó una línea de tendencia para *tagwise*). Tras contrastar los resultados se observó que estos no variaron de manera significativa en cuanto al análisis de significación final. De manera que se decidió usar la dispersión *tagwise* para las 3 comparaciones. En cambio, para el análisis de los genes comunes a los 3 grupos se usó *common* debido que la limitación del número de genes impedía realizar el análisis. Como ha podido verse, los resultados fueron los esperados en ambos casos.
+
+Gracias a las características de `edgeR` es relativamente sencillo comprobar los cambios al variar la dispersión, ya que la función `exactTest` permite especificarla de la siguiente manera.
+
+```{r results=FALSE}
+de12 = exactTest(d, pair = c("NIT","SFI"),dispersion="common")
+```
+
+## Aproximación GLM
+
+Con el fin de no alargar innecesariamente la sección se realizará el procedimiento para la comparación NIT-ELI, por ser la que a priori podría parecer más interesante desde el punto de vista biológico.
+
+**Generalized Linear Model (GLM)**
+
+Se crea una matriz de diseño para especificar los factores que se espera que afecten a los niveles de expresión. Se estiman los valores de dispersion relativos a la matriz de diseño. Se representa la tendencia para la dispersión *tagwise*.
+
+```{r GLM}
+# Matriz de diseño
+design.mat <- model.matrix(~ 0 + d$samples$group)
+colnames(design.mat) <- levels(d$samples$group)
+d2 <- estimateGLMCommonDisp(d,design.mat)
+d2 <- estimateGLMTrendedDisp(d2,design.mat)
+d2 <- estimateGLMTagwiseDisp(d2,design.mat)
+plotBCV(d2)
+```
+
+Se realiza un *likelihood ratio test*, especificando las diferencias de interés (entre grupos).
+
+```{r}
+fit <- glmFit(d2, design.mat)
+# lrt12 <- glmLRT(fit, contrast=c(1,-1,0))
+lrt13 <- glmLRT(fit, contrast=c(1,0,-1))
+# lrt23 <- glmLRT(fit, contrast=c(0,1,-1))
+topTags(lrt13, n=10)
+```
+
+genes DE resaltados.
+
+```{r echo=FALSE}
+plotMD(lrt13)
+abline(h=c(-0.5, 0.5), col="blue")
+```
+
+Representación gráfica.
+
+```{r}
+de13_n_2 <- decideTestsDGE(lrt13, adjust.method="BH", p.value = 0.05)
+de2tags13 <- rownames(d2)[as.logical(de13_n_2)]
+plotSmear(lrt13, de.tags=de2tags13)
+abline(h = c(-0.75, 0.75), col = "blue")
+```
+
+Gene Enrichment Analysis.
+
+```{r echo=FALSE}
+# NIT-ELI
+go_13_2 <- getBM(
+  filters = "ensembl_gene_id_version",
+  attributes = c("ensembl_gene_id_version", "go_id"),
+  values = rownames(d), mart = bm)
+
+# Comprueba si existe IDs GO inexistentes
+
+# Elimina
+go_13_2 <- go_13_2[-which(go_13_2$go_id==""),]
+
+# Comprobación
+
+# names y factor
+go13_2 <- factor(abs(de13_n_2))
+names(go13_2) <- rownames(de13_n_2)
+
+# Lista
+lista_genes13_2 <- unique(go_13_2$ensembl_gene_id_version)
+lista13_2 <- list()
+for (i in lista_genes13_2) {
+  lista13_2[[i]] = go_13_2[which(go_13_2$ensembl_gene_id_version==i),]$go_id
+}
+
+# Objeto topGOdata 13_2
+go_data13_2 <- new("topGOdata", ontology="BP", allGenes=go13_2, annot = annFUN.gene2GO, gene2GO = lista13_2)
+
+# Se usa el algoritmo weight01 y se determina el score de los tests con el Fisher’s exact test
+fisher13_2 = runTest(go_data13_2, algorithm = "weight01", statistic = "fisher")
+fisher13_2
+print(GenTable(go_data13_2, weightFisher = fisher13_2, orderBy = "weightFisher", topNodes = 10))
+
+# Gráfico nodos
+showSigOfNodes(go_data13_2, score(fisher13_2), firstSigNodes = 5, useInfo = "all")
+printGraph(go_data13_2, fisher13_2, firstSigNodes = 5, useInfo = "all", pdfSW = TRUE)
+```
+
+
+# Referencias
+
+(1). Anders, S., McCarthy, D., Chen, Y. et al. Count-based differential expression analysis of RNA sequencing data using R and Bioconductor. Nat Protoc 8, 1765–1786 (2013). https://doi.org/10.1038/nprot.2013.099
+
+(2). https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf
+
+(3). https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3378882/#:~:text=Biological%20CV%20(BCV)%20is%20the,depth%20could%20be%20increased%20indefinitely
+
+(4). https://m.ensembl.org/info/data/biomart/biomart_r_package.html
+
+(5). https://cran.r-project.org/web/packages/VennDiagram/VennDiagram.pdf
+
+(6). https://www.bioconductor.org/packages/devel/bioc/vignettes/biomaRt/inst/doc/biomaRt.html
+
+(7). Landau WM, Liu P. Dispersion estimation and its effect on test performance in RNA-seq data analysis: a simulation-based comparison of methods. PLoS One. 2013;8(12):e81415. Published 2013 Dec 9. doi:10.1371/journal.pone.0081415
+
+(8). https://stat.ethz.ch/pipermail/bioconductor/2014-February/057844.html
+
+(9). https://bioconductor.org/packages/release/bioc/vignettes/topGO/inst/doc/topGO.pdf
+
+(10). McDermaid A, Monier B, Zhao J, Liu B, Ma Q. Interpretation of differential gene expression results of RNA-seq data: review and integration. Brief Bioinform. 2019;20(6):2044‐2054. doi:10.1093/bib/bby067
